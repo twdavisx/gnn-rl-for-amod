@@ -13,17 +13,15 @@ This file contains the specifications for the AMoD system simulator. In particul
 """
 from collections import defaultdict
 import numpy as np
-import subprocess
-import os
 import networkx as nx
-from src.misc.utils import mat2str
 from copy import deepcopy
 import json
 
 class AMoD:
     # initialization
     def __init__(self, scenario, beta=0.2): # updated to take scenario and beta (cost for rebalancing) as input 
-        self.scenario = deepcopy(scenario) # I changed it to deep copy so that the scenario input is not modified by env 
+        self.scenario = deepcopy(scenario) # I changed it to deep copy so that the scenario input is not modified by env
+        self.rng = np.random.default_rng(scenario.sd)
         self.G = scenario.G # Road Graph: node - region, edge - connection of regions, node attr: 'accInit', edge attr: 'time'
         self.demandTime = self.scenario.demandTime
         self.rebTime = self.scenario.rebTime
@@ -77,49 +75,34 @@ class AMoD:
         # observation: current vehicle distribution, time, future arrivals, demand        
         self.obs = (self.acc, self.time, self.dacc, self.demand)
 
-    def matching(self, CPLEXPATH=None, PATH='', platform = 'linux'):
+    def greedy_matching(self):
         t = self.time
-        demandAttr = [(i,j,self.demand[i,j][t], self.price[i,j][t]) for i,j in self.demand \
-                      if t in self.demand[i,j] and self.demand[i,j][t]>1e-3]
-        accTuple = [(n,self.acc[n][t+1]) for n in self.acc]
-        modPath = os.getcwd().replace('\\','/')+'/src/cplex_mod/'
-        matchingPath = os.getcwd().replace('\\','/')+'/saved_files/cplex_logs/matching/'+PATH + '/'
-        if not os.path.exists(matchingPath):
-            os.makedirs(matchingPath)
-        datafile = matchingPath + 'data_{}.dat'.format(t)
-        resfile = matchingPath + 'res_{}.dat'.format(t)
-        with open(datafile,'w') as file:
-            file.write('path="'+resfile+'";\r\n')
-            file.write('demandAttr='+mat2str(demandAttr)+';\r\n')
-            file.write('accInitTuple='+mat2str(accTuple)+';\r\n')
-        modfile = modPath+'matching.mod'
-        if CPLEXPATH is None:
-            CPLEXPATH = "C:/Program Files/ibm/ILOG/CPLEX_Studio1210/opl/bin/x64_win64/"
-        my_env = os.environ.copy()
-        if platform == 'mac':
-            my_env["DYLD_LIBRARY_PATH"] = CPLEXPATH
-        else:
-            my_env["LD_LIBRARY_PATH"] = CPLEXPATH
-        out_file =  matchingPath + 'out_{}.dat'.format(t)
-        with open(out_file,'w') as output_f:
-            subprocess.check_call([CPLEXPATH+"oplrun", modfile,datafile],stdout=output_f,env=my_env)
-        output_f.close()
         flow = defaultdict(float)
-        with open(resfile,'r', encoding="utf8") as file:
-            for row in file:
-                item = row.replace('e)',')').strip().strip(';').split('=')
-                if item[0] == 'flow':
-                    values = item[1].strip(')]').strip('[(').split(')(')
-                    for v in values:
-                        if len(v) == 0:
-                            continue
-                        i,j,f = v.split(',')
-                        flow[int(i),int(j)] = float(f)
-        paxAction = [flow[i,j] if (i,j) in flow else 0 for i,j in self.edges]
+        available = {i: int(self.acc[i][t]) for i in self.region}
+
+        # build list of individual requests from the demand buckets
+        requests = []
+        for (i, j) in self.demand:
+            if t not in self.demand[i, j]:
+                continue
+            count = int(round(self.demand[i, j][t]))
+            requests.extend([(i, j)] * count)
+
+        # shuffle to simulate random arrival order within the timestep
+        self.rng.shuffle(requests)
+
+        # serve in order: each request gets a car if one is available in its origin zone
+        for i, j in requests:
+            if available[i] > 0:
+                flow[i, j] += 1
+                available[i] -= 1
+            # else: request is dropped (no car available in origin zone)
+
+        paxAction = [flow[i, j] if (i, j) in flow else 0 for i, j in self.edges]
         return paxAction
 
     # pax step
-    def pax_step(self, paxAction=None, CPLEXPATH=None, PATH='', platform =  'linux'):
+    def pax_step(self, paxAction):
         t = self.time
         self.reward = 0
         for i in self.region:
@@ -128,8 +111,6 @@ class AMoD:
         self.info["operating_cost"] = 0 # initialize operating cost
         self.info['revenue'] = 0
         self.info['rebalancing_cost'] = 0
-        if paxAction is None:  # default matching algorithm used if isMatching is True, matching method will need the information of self.acc[t+1], therefore this part cannot be put forward
-            paxAction = self.matching(CPLEXPATH=CPLEXPATH, PATH=PATH, platform = platform)
         self.paxAction = paxAction
         # serving passengers
         
@@ -428,17 +409,3 @@ class Scenario:
 
         return tripAttr
 
-#TODO: Needed?
-class Star2Complete(Scenario):
-    def __init__(self, N1 = 4, N2 =4, sd = 10, star_demand = 20, complete_demand = 1, star_center = [5,6,9,10],
-                 grid_travel_time=3, ninit = 50, demand_ratio=[1,1.5,1.5,1], alpha=0.2, fix_price=False): 
-        # beta - proportion of star network
-        # alpha - parameter for uniform distribution of demand [1-alpha, 1+alpha]
-        super(Star2Complete, self).__init__(N1=N1,N2=N2,sd=sd, ninit = ninit, 
-                                            grid_travel_time=grid_travel_time, 
-                                            fix_price = fix_price,
-                                            alpha = alpha,
-                                            demand_ratio = demand_ratio,
-                                            demand_input = {(i,j): complete_demand + (star_demand if i in star_center and j not in star_center else 0)
-                                                            for i in range(0,N1*N2) for j in range(0,N1*N2) if i!=j}
-                                            )

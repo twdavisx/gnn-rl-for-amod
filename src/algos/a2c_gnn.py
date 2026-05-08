@@ -19,7 +19,6 @@ import torch.nn.functional as F
 from torch.distributions import Dirichlet
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
-from torch_geometric.nn import global_mean_pool, global_max_pool
 from torch_geometric.utils import grid
 from collections import namedtuple
 
