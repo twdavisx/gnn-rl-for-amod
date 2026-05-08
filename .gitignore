@@ -3,7 +3,6 @@
 
 saved_files/ckpt/
 saved_files/rl_logs/
-saved_files/cplex_logs/
-saved_files/*.png
 
 .DS_Store
+*.pth
