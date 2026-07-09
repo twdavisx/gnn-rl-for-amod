@@ -9,3 +9,5 @@ saved_files/rl_logs/
 
 *.csv
 .gitignore
+
+scenario_nycReal.json

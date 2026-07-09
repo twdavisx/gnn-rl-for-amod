@@ -19,7 +19,6 @@ import torch.nn.functional as F
 from torch.distributions import Dirichlet
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
-from torch_geometric.utils import grid
 from collections import namedtuple
 
 SavedAction = namedtuple('SavedAction', ['log_prob', 'value'])
@@ -36,24 +35,30 @@ class GNNParser():
     """
     Parser converting raw environment observations to agent inputs (s_t).
     """
-    def __init__(self, env, T=10, grid_h=4, grid_w=4, scale_factor=0.01):
+    def __init__(self, env, T=10, scale_factor=0.01):
         super().__init__()
         self.env = env
         self.T = T
         self.s = scale_factor
-        self.grid_h = grid_h
-        self.grid_w = grid_w
-        
+        # Build the graph connectivity once from the environment's actual region
+        # graph (env.G), rather than assuming a fixed grid. env.G is the graph the
+        # simulator uses for rebalancing (a complete graph for JSON scenarios), so
+        # this keeps the GNN's message passing consistent with the real topology
+        # and works for any number of zones. Node ids are mapped to x-row indices
+        # via env.region order (the same order parse_obs builds x in).
+        node_idx = {n: i for i, n in enumerate(self.env.region)}
+        edges = [(node_idx[o], node_idx[d]) for o, d in self.env.G.edges]
+        self.edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+
     def parse_obs(self, obs):
         x = torch.cat((
-            torch.tensor([obs[0][n][self.env.time+1]*self.s for n in self.env.region]).view(1, 1, self.env.nregion).float(), 
+            torch.tensor([obs[0][n][self.env.time+1]*self.s for n in self.env.region]).view(1, 1, self.env.nregion).float(),
             torch.tensor([[(obs[0][n][self.env.time+1] + self.env.dacc[n][t])*self.s for n in self.env.region] \
-                          for t in range(self.env.time+1, self.env.time+self.T+1)]).view(1, self.T, self.env.nregion).float(), 
+                          for t in range(self.env.time+1, self.env.time+self.T+1)]).view(1, self.T, self.env.nregion).float(),
             torch.tensor([[sum([(self.env.scenario.demand_input[i,j][t])*(self.env.price[i,j][t])*self.s \
                           for j in self.env.region]) for i in self.env.region] for t in range(self.env.time+1, self.env.time+self.T+1)]).view(1, self.T, self.env.nregion).float()),
               dim=1).squeeze(0).view(21, self.env.nregion).T
-        edge_index, pos_coord = grid(height=self.grid_h, width=self.grid_w)
-        data = Data(x, edge_index)
+        data = Data(x, self.edge_index)
         return data
     
 #########################################

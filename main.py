@@ -65,7 +65,7 @@ parser.add_argument('--save', type=str2bool, default=True,
 
 args = parser.parse_args()
 
-save_name = args.reward+"_"+args.demand_ratio+"_"+args.fleet_scale
+save_name = args.reward+"_"+str(args.demand_ratio)+"_"+str(args.fleet_scale)
 
 # set device
 # would set mps but doesnt work with torch geometric
@@ -83,7 +83,7 @@ os.makedirs(f"./{args.directory}/ckpt/{args.json}", exist_ok=True)
 os.makedirs(f"./{args.directory}/rl_logs/{args.json}", exist_ok=True)
 # Initialize A2C-GNN
 
-model = A2C(env=env, input_size=21).to(device)
+model = A2C(env=env, input_size=21, device=device).to(device)
 
 if not args.test:
     #######################################
