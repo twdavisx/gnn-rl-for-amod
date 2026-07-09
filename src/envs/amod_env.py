@@ -19,8 +19,14 @@ import json
 
 class AMoD:
     # initialization
-    def __init__(self, scenario, beta=0.2): # updated to take scenario and beta (cost for rebalancing) as input 
+    def __init__(self, scenario, beta=0.2, reward_mode="revenue"): # updated to take scenario and beta (cost for rebalancing) as input
         self.scenario = deepcopy(scenario) # I changed it to deep copy so that the scenario input is not modified by env
+        self.reward_mode = reward_mode # which matching objective to optimize: revenue | served | worst | blend
+        # service objectives (served/worst) are cost-blind: they ignore rebalancing cost in
+        # the reward so they reposition freely. cost-aware objectives (revenue/blend) pay it.
+        # NOTE: rebalancing cost is still MEASURED in info for every mode -- only the reward
+        # signal changes -- so we can still report deadhead cost for the cost-blind agents.
+        self.charge_reb_cost = reward_mode not in ("served", "worst")
         self.rng = np.random.default_rng(scenario.sd)
         self.G = scenario.G # Road Graph: node - region, edge - connection of regions, node attr: 'accInit', edge attr: 'time'
         self.demandTime = self.scenario.demandTime
@@ -112,8 +118,14 @@ class AMoD:
         self.info['revenue'] = 0
         self.info['rebalancing_cost'] = 0
         self.paxAction = paxAction
+        # per-zone bookkeeping for worst-zone / blend rewards (independent of revenue/served accounting)
+        self.servedZone = {n: 0.0 for n in self.region} # pax served originating from each zone this step
+        self.demandZone = {n: 0.0 for n in self.region} # total demand originating from each zone this step
+        for (oi, oj) in self.demand:
+            if t in self.demand[oi, oj]:
+                self.demandZone[oi] += self.demand[oi, oj][t]
         # serving passengers
-        
+
         for k in range(len(self.edges)):
             i,j = self.edges[k]
             if (i,j) not in self.demand or t not in self.demand[i,j] or self.paxAction[k]<1e-3:
@@ -125,11 +137,29 @@ class AMoD:
             self.paxFlow[i,j][t+self.demandTime[i,j][t]] = self.paxAction[k]
             self.info["operating_cost"] += self.demandTime[i,j][t]*self.beta*self.paxAction[k]
             self.acc[i][t+1] -= self.paxAction[k]
-            self.info['served_demand'] += self.servedDemand[i,j][t]            
+            self.info['served_demand'] += self.servedDemand[i,j][t]
+            self.servedZone[i] += self.paxAction[k]
             self.dacc[j][t+self.demandTime[i,j][t]] += self.paxFlow[i,j][t+self.demandTime[i,j][t]]
             self.reward += self.paxAction[k]*(self.price[i,j][t] - self.demandTime[i,j][t]*self.beta)            
-            self.info['revenue'] += self.paxAction[k]*(self.price[i,j][t])  
-        
+            self.info['revenue'] += self.paxAction[k]*(self.price[i,j][t])
+
+        # select the matching reward according to the configured objective.
+        # revenue/served info above is always populated so every mode can be logged;
+        # only the reward signal handed to the agent changes here.
+        # no reward scaling: served/worst are cost-blind (see charge_reb_cost), so there is no
+        # competing rebalancing cost the matching signal has to be balanced against.
+        if self.reward_mode == "revenue":
+            pass  # self.reward already holds revenue minus per-trip operating cost
+        elif self.reward_mode == "served":
+            self.reward = self.info['served_demand']  # price-blind count of served pax
+        elif self.reward_mode == "worst":
+            # service rate of the worst-served zone (min over zones that had demand this step)
+            ratios = [self.servedZone[n] / self.demandZone[n]
+                      for n in self.region if self.demandZone[n] > 0]
+            self.reward = min(ratios) if ratios else 0.0
+        else:
+            raise ValueError(f"unknown reward_mode: {self.reward_mode!r} (expected revenue|served|worst)")
+
         self.obs = (self.acc, self.time, self.dacc, self.demand) # for acc, the time index would be t+1, but for demand, the time index would be t
         done = False # if passenger matching is executed first
         return self.obs, max(0,self.reward), done, self.info
@@ -150,9 +180,11 @@ class AMoD:
             self.rebFlow[i,j][t+self.rebTime[i,j][t]] = self.rebAction[k]       
             self.acc[i][t+1] -= self.rebAction[k] 
             self.dacc[j][t+self.rebTime[i,j][t]] += self.rebFlow[i,j][t+self.rebTime[i,j][t]]   
-            self.info['rebalancing_cost'] += self.rebTime[i,j][t]*self.beta*self.rebAction[k]
-            self.info["operating_cost"] += self.rebTime[i,j][t]*self.beta*self.rebAction[k]
-            self.reward -= self.rebTime[i,j][t]*self.beta*self.rebAction[k]
+            cost = self.rebTime[i,j][t]*self.beta*self.rebAction[k]
+            self.info['rebalancing_cost'] += cost  # always measured, for all modes
+            self.info["operating_cost"] += cost
+            if self.charge_reb_cost:               # only cost-aware objectives pay it in the reward
+                self.reward -= cost
         # arrival for the next time step, executed in the last state of a time step
         # this makes the code slightly different from the previous version, where the following codes are executed between matching and rebalancing        
         for k in range(len(self.edges)):
@@ -212,7 +244,10 @@ class AMoD:
     
 class Scenario:
     def __init__(self, N1=2, N2=4, tf=60, sd=None, ninit=5, tripAttr=None, demand_input=None, demand_ratio = None,
-                 trip_length_preference = 0.25, grid_travel_time = 1, fix_price=True, alpha = 0.2, json_file = None, json_hr = 9, json_tstep = 2, varying_time=False, json_regions = None):
+                 trip_length_preference = 0.25, grid_travel_time = 1, fix_price=True, alpha = 0.2, json_file = None, json_hr = 9, json_tstep = 2, varying_time=False, json_regions = None, fleet_scale = 1.0):
+        # fleet_scale: multiplier on the initial fleet size (1.0 = as-specified, <1 shrinks the
+        # fleet to create a supply-binding regime, >1 loosens supply)
+        self.fleet_scale = fleet_scale
         # trip_length_preference: positive - more shorter trips, negative - more longer trips
         # grid_travel_time: travel time between grids
         # demand_input： list - total demand out of each region, 
@@ -244,7 +279,7 @@ class Scenario:
                 self.rebTime[i,j] = defaultdict(lambda:(abs(i//N1-j//N1) + abs(i%N1-j%N1))*grid_travel_time)
             
             for n in self.G.nodes:
-                self.G.nodes[n]['accInit'] = int(ninit)
+                self.G.nodes[n]['accInit'] = int(ninit * self.fleet_scale)
             self.tf = tf
             self.demand_ratio = defaultdict(list)
             
@@ -342,7 +377,7 @@ class Scenario:
                 hr, acc = item["hour"], item["acc"]
                 if hr == json_hr+int(round(json_tstep/2*tf/60)):
                     for n in self.G.nodes:
-                        self.G.nodes[n]['accInit'] = int(acc/len(self.G))
+                        self.G.nodes[n]['accInit'] = int(acc/len(self.G) * self.fleet_scale)
             self.tripAttr = self.get_random_demand()
                 
         

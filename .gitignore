@@ -6,3 +6,6 @@ saved_files/rl_logs/
 
 .DS_Store
 *.pth
+
+*.csv
+.gitignore
