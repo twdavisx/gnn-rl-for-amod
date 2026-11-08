@@ -11,3 +11,12 @@ saved_files/rl_logs/
 .gitignore
 
 scenario_nycReal.json
+*.png
+
+saved_files/*.png
+
+results.py
+
+zone_map.py
+
+taxi_zones

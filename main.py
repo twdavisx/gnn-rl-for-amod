@@ -58,6 +58,18 @@ parser.add_argument('--CUDA', type=str2bool, default=True,
                     help='disables CUDA training')
 parser.add_argument('--reward', type=str, default="revenue",
                     help='reward mode')
+parser.add_argument('--baseline', type=str2bool, default=False,
+                    help='non-RL baseline to evaluate instead of a trained policy: "none" = never '
+                         'rebalance (serve only from the zone a vehicle is already in). '
+                         'empty = use the trained RL policy. only used with --test True')
+parser.add_argument('--early_stop', type=str2bool, default=False,
+                    help='stop early when the smoothed train reward stops improving')
+parser.add_argument('--patience', type=int, default=500, metavar='N',
+                    help='episodes without improvement before stopping (default: 500)')
+parser.add_argument('--min_delta', type=float, default=0.01, metavar='S',
+                    help='relative improvement required to count, as a fraction of |best| (default: 0.01 = 1%%)')
+parser.add_argument('--es_window', type=int, default=100, metavar='N',
+                    help='moving-average window for early stopping (default: 100)')
 
 #image saving
 parser.add_argument('--save', type=str2bool, default=True,
@@ -65,7 +77,25 @@ parser.add_argument('--save', type=str2bool, default=True,
 
 args = parser.parse_args()
 
-save_name = args.reward+"_"+str(args.demand_ratio)+"_"+str(args.fleet_scale)
+
+# SAVE NAME NEED TO INCLUDE LAMBDA THO WITH LAMBA UNKNOWN CAN 
+save_name = args.reward+"_"+str(args.demand_ratio)+"_"+str(args.fleet_scale)+"_"+str(args.seed)
+
+
+if args.baseline:
+    # baselines are policy-free, so key them by regime only (not by reward mode) and keep them
+    # in a separate namespace so they never overwrite trained-agent logs
+    save_name = "baseline_"+str(args.demand_ratio)+"_"+str(args.fleet_scale)
+
+# --seed only reaches numpy (the Poisson demand draws) via Scenario; seed torch too so that
+# policy init and Dirichlet action sampling are controlled. without this, runs are not
+# reproducible and changing --seed does not actually vary the policy.
+
+if args.test:
+    args.seed = 42
+
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
 
 # set device
 # would set mps but doesnt work with torch geometric
@@ -102,6 +132,12 @@ if not args.test:
     epochs = trange(train_episodes) #epoch iterator
     best_reward = -np.inf #set best reward
     model.train() #set model in train mode
+    # early stopping state: watch a moving average of train reward (raw episode reward is far
+    # too noisy), and require a RELATIVE improvement so one threshold works across reward modes
+    # whose scales differ by orders of magnitude (revenue ~1e3 vs worst ~1e1).
+    best_ma = -np.inf
+    episodes_since_improve = 0
+    stopped_at = train_episodes
 
     for i_episode in epochs:
         obs = env.reset() #initialize environment
@@ -152,6 +188,23 @@ if not args.test:
         log['train_profit'].append(episode_revenue - episode_operating_cost)
         model.log(log, path=f"./{args.directory}/rl_logs/"+args.json+"/"+save_name+".pth")
 
+        # early stopping on the smoothed train reward
+        if args.early_stop and len(log['train_reward']) >= args.es_window:
+            ma = float(np.mean(log['train_reward'][-args.es_window:]))
+            if best_ma == -np.inf:
+                best_ma = ma
+                episodes_since_improve = 0
+            elif ma > best_ma + args.min_delta * abs(best_ma):
+                best_ma = ma
+                episodes_since_improve = 0
+            else:
+                episodes_since_improve += 1
+            if episodes_since_improve >= args.patience:
+                stopped_at = i_episode + 1
+                print(f"\nEarly stop at episode {stopped_at}: no >{args.min_delta:.1%} improvement "
+                      f"in {args.patience} episodes (best {args.es_window}-ep avg = {best_ma:.2f})")
+                break
+
     # Plot reward and revenue per episode (twin axes: reward and revenue can be on
     # different scales in non-revenue modes, e.g. served/worst)
     if args.save:
@@ -182,46 +235,101 @@ if not args.test:
         print(f"Plot saved to ./{args.directory}/{save_name}.png")
 
 else:
-    # Load pre-trained model
+    # Load pre-trained model (baselines are policy-free, so there is no checkpoint to load)
     #TODO load with user specified name
-    model.load_checkpoint(path=f"./{args.directory}/ckpt/"+args.json+"/"+save_name+".pth")
-    test_episodes = args.max_episodes #set max number of training episodes
-    T = args.max_steps #set episode length
+    if not args.baseline:
+        model.load_checkpoint(path=f"./{args.directory}/ckpt/"+args.json+"/"+save_name+".pth")
+    else:
+        print(f"evaluating non-RL baseline: {args.baseline}")
+    test_episodes = args.max_episodes #set number of evaluation episodes
+    T = args.max_steps #set episode length (must match training horizon)
     epochs = trange(test_episodes) #epoch iterator
+    model.eval()
     #Initialize lists for logging
-    log = {'test_reward': [], 
-           'test_served_demand': [], 
-           'test_reb_cost': []}
+    log = {'test_reward': [],
+           'test_served_demand': [],
+           'test_reb_cost': [],
+           'test_revenue': [],
+           'test_profit': [],
+           'test_service_rate': [],
+           'test_worst_ratio': [],
+           'test_avg_ride_length': [],
+           # per-zone served/demand for EVERY episode (one list of len(region) each). logging
+           # both (rather than the ratio) lets us pool correctly post-hoc as
+           # sum(served)/sum(demand) instead of averaging per-episode ratios, and keeps the
+           # absolute volumes for the spatial comparison figure.
+           'test_zone_served': [],
+           'test_zone_demand': [],
+           'test_zone_ids': list(env.region)}
     for episode in epochs:
         episode_reward = 0
         episode_served_demand = 0
         episode_rebalancing_cost = 0
+        episode_revenue = 0
+        episode_operating_cost = 0
+        episode_total_demand = 0
+        episode_ride_time = 0
+        # accumulate per-zone service over the WHOLE episode, so the worst-zone ratio is
+        # "worst-served zone across the morning", not an average of noisy per-step minima
+        zone_served = {n: 0.0 for n in env.region}
+        zone_demand = {n: 0.0 for n in env.region}
         obs = env.reset()
-        done = False
-        k = 0
-        while(not done):
+        for step in range(T):
             # take matching step (Step 1 in paper)
             obs, paxreward, done, info = env.pax_step(paxAction=env.greedy_matching())
             episode_reward += paxreward
-            # use GNN-RL policy (Step 2 in paper)
-            action_rl = model.select_action(obs)
-            # transform sample from Dirichlet into actual vehicle counts (i.e. (x1*x2*..*xn)*num_vehicles)
-            desiredAcc = {env.region[i]: int(action_rl[i] *dictsum(env.acc,env.time+1))for i in range(len(env.region))}
-            # solve minimum rebalancing distance problem (Step 3 in paper)
-            rebAction = solveRebFlow(env, desiredAcc)
+            for n in env.region:
+                zone_served[n] += env.servedZone[n]
+                zone_demand[n] += env.demandZone[n]
+            if args.baseline:
+                # non-RL baseline: never rebalance. vehicles only serve demand originating in
+                # whatever zone they already happen to be sitting in.
+                rebAction = [0.0] * len(env.edges)
+            else:
+                # use GNN-RL policy (Step 2 in paper)
+                action_rl = model.select_action(obs)
+                # transform sample from Dirichlet into actual vehicle counts (i.e. (x1*x2*..*xn)*num_vehicles)
+                desiredAcc = {env.region[i]: int(action_rl[i] *dictsum(env.acc,env.time+1))for i in range(len(env.region))}
+                # solve minimum rebalancing distance problem (Step 3 in paper)
+                rebAction = solveRebFlow(env, desiredAcc)
             # Take action in environment
             new_obs, rebreward, done, info = env.reb_step(rebAction)
             episode_reward += rebreward
             # track performance over episode
             episode_served_demand += info['served_demand']
             episode_rebalancing_cost += info['rebalancing_cost']
-            k += 1
-        # Send current statistics to screen
-        epochs.set_description(f"Episode {episode+1} | Reward: {episode_reward:.2f} | ServedDemand: {episode_served_demand:.2f} | Reb. Cost: {episode_rebalancing_cost}")
+            episode_revenue += info['revenue']
+            episode_operating_cost += info['operating_cost']  # includes rebalancing cost
+            episode_total_demand += info['total_demand']
+            episode_ride_time += info['ride_time']
+            if done:
+                break
+        # episode-level derived metrics
+        served_zones = [zone_served[n]/zone_demand[n] for n in env.region if zone_demand[n] > 0]
+        worst_ratio = min(served_zones) if served_zones else 0.0
+        service_rate = episode_served_demand/episode_total_demand if episode_total_demand > 0 else 0.0
+        # ride length in minutes (demandTime is in timesteps)
+        avg_ride_length = (episode_ride_time/episode_served_demand*args.json_tsetp) if episode_served_demand > 0 else 0.0
+
+        epochs.set_description(f"Episode {episode+1} | Reward: {episode_reward:.2f} | ServedDemand: {episode_served_demand:.2f} | Reb. Cost: {episode_rebalancing_cost:.2f}")
         # Log KPIs
         log['test_reward'].append(episode_reward)
         log['test_served_demand'].append(episode_served_demand)
         log['test_reb_cost'].append(episode_rebalancing_cost)
+        log['test_revenue'].append(episode_revenue)
+        log['test_profit'].append(episode_revenue - episode_operating_cost)
+        log['test_service_rate'].append(service_rate)
+        log['test_worst_ratio'].append(worst_ratio)
+        log['test_avg_ride_length'].append(avg_ride_length)
+        log['test_zone_served'].append([zone_served[n] for n in env.region])
+        log['test_zone_demand'].append([zone_demand[n] for n in env.region])
         model.log(log, path=f"./{args.directory}/rl_logs/{args.json}/{save_name}_test.pth")
-        break
 
+    # summary across evaluation episodes -> one row of the results table
+    print(f"\n=== EVAL  json={args.json}  reward={args.reward}  "
+          f"demand_ratio={args.demand_ratio}  fleet_scale={args.fleet_scale}  "
+          f"({len(log['test_reward'])} episodes) ===")
+    for k_ in ['test_reward', 'test_revenue', 'test_profit', 'test_served_demand',
+               'test_service_rate', 'test_worst_ratio', 'test_reb_cost', 'test_avg_ride_length']:
+        v = np.array(log[k_])
+        print(f"{k_.replace('test_',''):>18}: {v.mean():12.3f}  +/- {v.std():.3f}")

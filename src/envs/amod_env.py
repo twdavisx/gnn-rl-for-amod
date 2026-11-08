@@ -22,11 +22,16 @@ class AMoD:
     def __init__(self, scenario, beta=0.2, reward_mode="revenue"): # updated to take scenario and beta (cost for rebalancing) as input
         self.scenario = deepcopy(scenario) # I changed it to deep copy so that the scenario input is not modified by env
         self.reward_mode = reward_mode # which matching objective to optimize: revenue | served | worst | blend
-        # service objectives (served/worst) are cost-blind: they ignore rebalancing cost in
-        # the reward so they reposition freely. cost-aware objectives (revenue/blend) pay it.
-        # NOTE: rebalancing cost is still MEASURED in info for every mode -- only the reward
-        # signal changes -- so we can still report deadhead cost for the cost-blind agents.
-        self.charge_reb_cost = reward_mode not in ("served", "worst")
+        # how much of the rebalancing cost each objective pays IN ITS REWARD.
+        # revenue is in dollars, so it pays the cost at face value (1.0). served/worst are
+        # bounded ratios (~0-1 per step) while rebalancing cost is ~300-500 per step -- paying
+        # face value would swamp them ~1000x and the agent would simply stop rebalancing.
+        # at 1e-4 the cost acts as a mild tie-breaker (prefer the cheaper of two equally good
+        # policies) without overriding the objective: for `worst`, uniform rebalancing only
+        # keeps beating no-rebalancing while the weight stays below ~4e-4.
+        # NOTE: rebalancing cost is still MEASURED in info for every mode regardless -- only the
+        # reward signal changes -- so we can still report deadhead cost for every agent.
+        self.reb_cost_weight = 1.0 if reward_mode == "revenue" else 1e-4
         self.rng = np.random.default_rng(scenario.sd)
         self.G = scenario.G # Road Graph: node - region, edge - connection of regions, node attr: 'accInit', edge attr: 'time'
         self.demandTime = self.scenario.demandTime
@@ -111,12 +116,14 @@ class AMoD:
     def pax_step(self, paxAction):
         t = self.time
         self.reward = 0
+        r = 0
         for i in self.region:
             self.acc[i][t+1] = self.acc[i][t]
         self.info['served_demand'] = 0 # initialize served demand
         self.info["operating_cost"] = 0 # initialize operating cost
         self.info['revenue'] = 0
         self.info['rebalancing_cost'] = 0
+        self.info['ride_time'] = 0 # sum of trip times over served pax (for avg ride length)
         self.paxAction = paxAction
         # per-zone bookkeeping for worst-zone / blend rewards (independent of revenue/served accounting)
         self.servedZone = {n: 0.0 for n in self.region} # pax served originating from each zone this step
@@ -139,9 +146,18 @@ class AMoD:
             self.acc[i][t+1] -= self.paxAction[k]
             self.info['served_demand'] += self.servedDemand[i,j][t]
             self.servedZone[i] += self.paxAction[k]
+            r+=self.paxAction[k]*(self.price[i,j][t] - self.demandTime[i,j][t]*self.beta)
             self.dacc[j][t+self.demandTime[i,j][t]] += self.paxFlow[i,j][t+self.demandTime[i,j][t]]
-            self.reward += self.paxAction[k]*(self.price[i,j][t] - self.demandTime[i,j][t]*self.beta)            
             self.info['revenue'] += self.paxAction[k]*(self.price[i,j][t])
+            self.info['ride_time'] += self.demandTime[i,j][t]*self.paxAction[k]
+
+        # metrics computed for EVERY mode (not just the one being optimized), so any agent can be
+        # scored on all of them at eval time
+        ratios = [self.servedZone[n] / self.demandZone[n]
+                  for n in self.region if self.demandZone[n] > 0]
+        worst_ratio = min(ratios) if ratios else 0.0
+        self.info['worst_ratio'] = worst_ratio               # service rate of worst-served zone
+        self.info['total_demand'] = sum(self.demandZone.values())  # demand appearing this step
 
         # select the matching reward according to the configured objective.
         # revenue/served info above is always populated so every mode can be logged;
@@ -149,14 +165,11 @@ class AMoD:
         # no reward scaling: served/worst are cost-blind (see charge_reb_cost), so there is no
         # competing rebalancing cost the matching signal has to be balanced against.
         if self.reward_mode == "revenue":
-            pass  # self.reward already holds revenue minus per-trip operating cost
+            self.reward += r
         elif self.reward_mode == "served":
-            self.reward = self.info['served_demand']  # price-blind count of served pax
+            self.reward += self.info['served_demand']/self.info['total_demand']
         elif self.reward_mode == "worst":
-            # service rate of the worst-served zone (min over zones that had demand this step)
-            ratios = [self.servedZone[n] / self.demandZone[n]
-                      for n in self.region if self.demandZone[n] > 0]
-            self.reward = min(ratios) if ratios else 0.0
+            self.reward += worst_ratio
         else:
             raise ValueError(f"unknown reward_mode: {self.reward_mode!r} (expected revenue|served|worst)")
 
@@ -183,8 +196,7 @@ class AMoD:
             cost = self.rebTime[i,j][t]*self.beta*self.rebAction[k]
             self.info['rebalancing_cost'] += cost  # always measured, for all modes
             self.info["operating_cost"] += cost
-            if self.charge_reb_cost:               # only cost-aware objectives pay it in the reward
-                self.reward -= cost
+            self.reward -= self.reb_cost_weight * cost  # weight is per-mode (see __init__)
         # arrival for the next time step, executed in the last state of a time step
         # this makes the code slightly different from the previous version, where the following codes are executed between matching and rebalancing        
         for k in range(len(self.edges)):
@@ -443,4 +455,4 @@ class Scenario:
                     tripAttr.append((i,j,t,demand[i,j][t],price[i,j][t]))
 
         return tripAttr
-
+    
